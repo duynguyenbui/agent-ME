@@ -1,0 +1,5 @@
+# Custom AI Agent Configurations
+/.opencode/opencode.json
+/.codex/config.toml
+/.agents/mcp_config.json
+/.grok/config.toml
