@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+# Exa API CLI — search + contents, with common flags
+set -euo pipefail
+
+CMD="${0##*/}"
+
+# ── API key ──────────────────────────────────────────────
+resolve_api_key() {
+  if [ -n "${EXA_API_KEY:-}" ]; then
+    return
+  fi
+  if [ -f "$HOME/.config/exa-api-key" ]; then
+    EXA_API_KEY="$(cat "$HOME/.config/exa-api-key")"
+    return
+  fi
+  echo "Missing EXA_API_KEY. Place it in ~/.config/exa-api-key or set EXA_API_KEY env var." >&2
+  exit 1
+}
+
+# ── sub: search ──────────────────────────────────────────
+cmd_search() {
+  local query=""
+  local type="" category="" num="" include="" exclude=""
+  local start_date="" end_date=""
+  local text="" summary="" highlights=""
+  local system_prompt="" live="" max_age=""
+
+  # Parse flags before positional query
+  local args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --type)        shift; type="$1" ;;
+      --category)    shift; category="$1" ;;
+      --num-results) shift; num="$1" ;;
+      --include)     shift; include="$1" ;;
+      --exclude)     shift; exclude="$1" ;;
+      --start-date)  shift; start_date="$1" ;;
+      --end-date)    shift; end_date="$1" ;;
+      --text)        text="true" ;;
+      --summary)     summary="true" ;;
+      --highlights)  highlights="true" ;;
+      --no-highlights) highlights="false" ;;
+      --system)      shift; system_prompt="$1" ;;
+      --live)        shift; max_age="${1:-0}" ;;
+      --max-age)     shift; max_age="$1" ;;
+      *)             args+=("$1") ;;
+    esac
+    shift
+  done
+
+  # Restore positional args
+  set -- "${args[@]}"
+  query="$*"
+
+  if [ -z "$query" ]; then
+    echo "Usage: $CMD search [flags] <query>" >&2
+    echo "Flags: --type (auto|neural|fast|deep|deep-reasoning|instant)" >&2
+    echo "       --category (news|company|research paper|people|...)" >&2
+    echo "       --num-results N   --include domain1,domain2   --exclude ..." >&2
+    echo "       --start-date YYYY-MM-DD   --end-date ..." >&2
+    echo "       --text  --summary  --highlights (default)  --no-highlights" >&2
+    echo "       --system <prompt>   --live [hours]   --max-age <hours>" >&2
+    exit 1
+  fi
+
+  resolve_api_key
+
+  # Build request JSON using jq directly (pass null for omitted flags)
+  local body='{}'
+  body="$(echo "$body" | jq --arg q "$query" '. + {query: $q}')"
+  body="$(echo "$body" | jq --argjson n "${num:-8}" '. + {numResults: $n}')"
+
+  # Optional strings: only include when non-empty
+  if [ -n "$type" ]; then
+    body="$(echo "$body" | jq --arg t "$type" '. + {type: $t}')"
+  fi
+  if [ -n "$category" ]; then
+    body="$(echo "$body" | jq --arg c "$category" '. + {category: $c}')"
+  fi
+  if [ -n "$start_date" ]; then
+    body="$(echo "$body" | jq --arg d "$start_date" '. + {startPublishedDate: $d}')"
+  fi
+  if [ -n "$end_date" ]; then
+    body="$(echo "$body" | jq --arg d "$end_date" '. + {endPublishedDate: $d}')"
+  fi
+  if [ -n "$system_prompt" ]; then
+    body="$(echo "$body" | jq --arg s "$system_prompt" '. + {systemPrompt: $s}')"
+  fi
+  if [ -n "$include" ]; then
+    body="$(echo "$body" | jq --arg d "$include" '. + {includeDomains: ($d | split(","))}')"
+  fi
+  if [ -n "$exclude" ]; then
+    body="$(echo "$body" | jq --arg d "$exclude" '. + {excludeDomains: ($d | split(","))}')"
+  fi
+  if [ -n "$max_age" ]; then
+    body="$(echo "$body" | jq --argjson a "$max_age" '. + {maxAgeHours: $a}')"
+  fi
+
+  # Build contents sub-object
+  local contents='{}'
+  if [ "${highlights:-true}" = "true" ]; then
+    contents="$(echo "$contents" | jq '. + {highlights: true}')"
+  fi
+  if [ "$text" = "true" ]; then
+    contents="$(echo "$contents" | jq '. + {text: true}')"
+  fi
+  if [ "$summary" = "true" ]; then
+    contents="$(echo "$contents" | jq '. + {summary: true}')"
+  fi
+  if [ "$contents" != "{}" ]; then
+    body="$(echo "$body" | jq --argjson c "$contents" '. + {contents: $c}')"
+  fi
+
+  curl -sS -X POST 'https://api.exa.ai/search' \
+    -H "x-api-key: ${EXA_API_KEY}" \
+    -H 'Content-Type: application/json' \
+    -d "$body" \
+  | jq '{
+    requestId,
+    results: [
+      .results[] | {
+        title,
+        url,
+        publishedDate,
+        author,
+        text: (.text // null),
+        highlights,
+        summary: (.summary // null)
+      }
+    ],
+    costDollars
+  }'
+}
+
+# ── sub: contents ────────────────────────────────────────
+cmd_contents() {
+  local url=""
+  local text="true" highlights="true" summary="true"
+  local max_chars="" subpages="" live="" max_age="" timeout=""
+
+  # Parse flags before positional url
+  local args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --text)         text="true" ;;
+      --no-text)      text="false" ;;
+      --highlights)   highlights="true" ;;
+      --no-highlights) highlights="false" ;;
+      --summary)      summary="true" ;;
+      --no-summary)   summary="false" ;;
+      --max-chars)    shift; max_chars="$1" ;;
+      --subpages)     shift; subpages="$1" ;;
+      --live)         shift; max_age="${1:-0}" ;;
+      --max-age)      shift; max_age="$1" ;;
+      --timeout)      shift; timeout="$1" ;;
+      *)              args+=("$1") ;;
+    esac
+    shift
+  done
+
+  set -- "${args[@]}"
+  url="${1:-}"
+
+  if [ -z "$url" ]; then
+    echo "Usage: $CMD contents [flags] <url>" >&2
+    echo "Flags: --text (default) --no-text" >&2
+    echo "       --highlights (default) --no-highlights" >&2
+    echo "       --summary (default) --no-summary" >&2
+    echo "       --max-chars N   --subpages N" >&2
+    echo "       --live [hours]  --max-age <hours>  --timeout <ms>" >&2
+    exit 1
+  fi
+
+  resolve_api_key
+
+  # Build the request body step by step
+  local body='{}'
+  body="$(echo "$body" | jq --arg u "$url" '. + {urls: [$u]}')"
+
+  if [ "$text" = "true" ]; then
+    if [ -n "$max_chars" ]; then
+      body="$(echo "$body" | jq --argjson mc "$max_chars" '. + {text: {maxCharacters: $mc}}')"
+    else
+      body="$(echo "$body" | jq '. + {text: true}')"
+    fi
+  fi
+
+  if [ "$highlights" = "true" ]; then
+    body="$(echo "$body" | jq '. + {highlights: true}')"
+  fi
+
+  if [ "$summary" = "true" ]; then
+    body="$(echo "$body" | jq '. + {summary: true}')"
+  fi
+
+  [ -n "$max_age" ]  && body="$(echo "$body" | jq --argjson ma "$max_age" '. + {maxAgeHours: $ma}')"
+  [ -n "$timeout" ]  && body="$(echo "$body" | jq --argjson to "$timeout" '. + {livecrawlTimeout: $to}')"
+  [ -n "$subpages" ] && body="$(echo "$body" | jq --argjson sp "$subpages" '. + {subpages: $sp}')"
+
+  curl -sS -X POST 'https://api.exa.ai/contents' \
+    -H "x-api-key: ${EXA_API_KEY}" \
+    -H 'Content-Type: application/json' \
+    -d "$body" \
+  | jq '{
+    requestId,
+    results: [
+      .results[] | {
+        title,
+        url,
+        publishedDate,
+        author,
+        text: (.text // null),
+        highlights,
+        summary: (.summary // null),
+        subpages: (.subpages // null)
+      }
+    ],
+    statuses,
+    costDollars
+  }'
+}
+
+# ── sub: answer ──────────────────────────────────────────
+cmd_answer() {
+  local query="$*"
+
+  if [ -z "$query" ]; then
+    echo "Usage: $CMD answer <question>" >&2
+    exit 1
+  fi
+
+  resolve_api_key
+
+  curl -sS -X POST 'https://api.exa.ai/answer' \
+    -H "x-api-key: ${EXA_API_KEY}" \
+    -H 'Content-Type: application/json' \
+    -d "$(jq -n --arg q "$query" '{
+      query: $q,
+      text: true
+    }')" \
+  | jq '{
+    requestId,
+    answer: .answer,
+    citations: [
+      .citations[]? | {
+        title,
+        url,
+        publishedDate
+      }
+    ]
+  }'
+}
+
+# ── dispatch ─────────────────────────────────────────────
+case "${1:-}" in
+  search)
+    shift
+    cmd_search "$@"
+    ;;
+  contents)
+    shift
+    cmd_contents "$@"
+    ;;
+  answer)
+    shift
+    cmd_answer "$@"
+    ;;
+  *)
+    echo "$CMD – Exa API CLI"
+    echo ""
+    echo "Commands:"
+    echo "  $CMD search [flags] <query>       Web search with optional filters"
+    echo "  $CMD contents [flags] <url>        Extract page content"
+    echo "  $CMD answer <question>             Quick LLM answer with citations"
+    echo ""
+    echo "API key: set EXA_API_KEY env var or write to ~/.config/exa-api-key"
+    exit 1
+    ;;
+esac
